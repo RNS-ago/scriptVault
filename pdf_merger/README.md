@@ -8,11 +8,13 @@ Supports `.pdf`, `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gi
 
 | File | Purpose |
 |---|---|
-| `setup.sh` / `setup.ps1` | One-time setup. Creates `.venv` and installs dependencies. |
-| `run.sh` / `run.ps1` | Ensures setup, then launches the TUI. |
+| `setup.sh` / `setup.ps1` / `setup.cmd` | One-time setup. Creates `.venv` and installs dependencies. |
+| `run.sh` / `run.ps1` / `run.cmd` | Ensures setup, then launches the TUI. |
 | `merge_to_pdf.py` | The CLI (built with Typer). |
 | `merge_to_pdf_tui.py` | The TUI (built with Textual). |
 | `requirements.txt` | Pinned dependencies. |
+
+On Windows, the `.cmd` files are double-clickable from File Explorer and don't require any PowerShell setup. The `.ps1` files do the actual work; `.cmd` are tiny wrappers that invoke them with the execution policy bypassed for that one call.
 
 You only need Python 3.9+ installed. The setup script handles everything else.
 
@@ -27,13 +29,17 @@ chmod +x run.sh setup.sh    # one-time
 ./run.sh
 ```
 
-**Windows (PowerShell)**
+**Windows**
 
-```powershell
-.\run.ps1
+Double-click **`run.cmd`** in File Explorer, or from a terminal:
+
+```cmd
+run.cmd
 ```
 
-`run.sh` / `run.ps1` calls the setup script automatically the first time, then launches the TUI. Subsequent runs start instantly.
+If you're already in PowerShell and prefer to use the script directly, `.\run.ps1` works the same — see *PowerShell on Windows* below for the one-time setup it requires.
+
+`run.sh` / `run.cmd` / `run.ps1` calls the setup script automatically the first time, then launches the TUI. Subsequent runs start instantly.
 
 ### 2. Use the CLI directly (for experienced users)
 
@@ -42,7 +48,8 @@ Run the setup script once:
 ```bash
 chmod +x setup.sh    # one-time, macOS/Linux only
 ./setup.sh           # macOS / Linux
-.\setup.ps1          # Windows
+setup.cmd            # Windows (double-clickable, no PS setup needed)
+.\setup.ps1          # Windows (PowerShell, see note below)
 ```
 
 It prints exactly how to call the CLI when it's done. Either invoke the venv's Python directly:
@@ -62,11 +69,16 @@ python merge_to_pdf.py ./scans -o report.pdf
 
 Setup is idempotent — it only reinstalls when `requirements.txt` has actually changed.
 
-If PowerShell complains about execution policy, run this once:
+### PowerShell on Windows
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
+Windows blocks `.ps1` scripts by default. You have two options:
+
+- **Use `setup.cmd` and `run.cmd`.** The `.cmd` wrappers are unrestricted and call PowerShell with `-ExecutionPolicy Bypass` for that single invocation. Nothing to configure, double-clickable from Explorer.
+- **Or relax the policy once.** Open PowerShell and run:
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+  ```
+  After that, `.\setup.ps1` and `.\run.ps1` work directly. Files downloaded from the internet may also need to be unblocked: right-click → **Properties** → **Unblock** → OK.
 
 ## CLI reference
 
