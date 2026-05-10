@@ -1,7 +1,7 @@
 
 # dirs
 .venv/
-
+__pycache__
 
 # files
 *.pdf
