@@ -601,13 +601,12 @@ fi
 # location). We use this list to post-process artwork below.
 CMD+=(--print-to-file "after_move:%(filepath)s" "$PRODUCED_LIST")
 
-# Always-useful parse-metadata mappings (used when overrides are blank)
 if [[ $IS_PLAYLIST -eq 1 ]]; then
     CMD+=(--parse-metadata "playlist_index:%(track_number)s")
-    CMD+=(--parse-metadata "playlist_title:%(album)s")
+    [[ -z "$ALBUM" ]] && CMD+=(--parse-metadata "playlist_title:%(album)s")
 fi
-CMD+=(--parse-metadata "uploader:%(artist)s")
-CMD+=(--parse-metadata "uploader:%(album_artist)s")
+[[ -z "$ARTIST" ]]       && CMD+=(--parse-metadata "uploader:%(artist)s")
+[[ -z "$ALBUM_ARTIST" ]] && CMD+=(--parse-metadata "uploader:%(album_artist)s")
 
 # Force-set metadata tags by passing -metadata args straight to ffmpeg.
 # We only emit an override when the user's value differs from what yt-dlp

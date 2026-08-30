@@ -52,6 +52,12 @@ gstatus=$(vargit status --porcelain)
 if [[ -n "$gstatus" ]]; then
     vargit add "$ADD_FLAG"
     vargit commit -m "Automated snapshot" -m "$gstatus"
+fi
+
+if vargit fetch --quiet; then
     vargit pull --rebase
     vargit push
+else
+    echo "No network — skipping remote sync, will retry next run." >&2
+    exit 0
 fi
