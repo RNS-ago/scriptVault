@@ -332,7 +332,8 @@ fetch_preview() {
     local url="$1" raw key value
     info "Fetching metadata preview from URL…"
 
-    if ! raw=$(yt-dlp --skip-download --no-warnings --ignore-no-formats-error \
+    if ! raw=$(yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+        --skip-download --no-warnings --ignore-no-formats-error \
         --playlist-items 1 \
         --print "TITLE=%(title)s" \
         --print "UPLOADER=%(uploader)s" \
@@ -403,6 +404,95 @@ build_video_format_selector() {
             echo "bestvideo${v_h}+bestaudio${a_b}/best${v_h}"
             ;;
     esac
+}
+
+# List subtitle tracks of the first video at $1, one row per track:
+#   kind <TAB> code <TAB> name     (kind = subs for uploaded, auto for auto-generated)
+# Uploaded rows come first, so row N is the number shown in the picker.
+list_subs() {
+    yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+        -j --no-warnings --ignore-no-formats-error --playlist-items 1 "$1" \
+    | python3 -c '
+import sys, json
+d = json.loads(sys.stdin.readline())
+for kind, key in (("subs", "subtitles"), ("auto", "automatic_captions")):
+    for code, tracks in (d.get(key) or {}).items():
+        if code == "live_chat":
+            continue
+        name = next((t["name"] for t in tracks if t.get("name")), "")
+        print(f"{kind}\t{code}\t{name}")
+'
+}
+
+# Print the rows of one kind from list_subs output as a numbered,
+# multi-column list. Args: $1 = heading, $2 = kind, $3 = rows.
+print_sub_section() {
+    local lines
+    lines=$(awk -F'\t' -v k="$2" '$1==k {printf "%3d) %-8s %s\n", NR, $2, $3}' <<<"$3")
+    [[ -z "$lines" ]] && return 0
+    printf "  %s%s:%s\n" "$BOLD" "$1" "$RESET"
+    column -c "$(tput cols 2>/dev/null || echo 80)" <<<"$lines" 2>/dev/null || printf "%s\n" "$lines"
+    echo
+}
+
+# Interactive subtitle picker for video mode. Shows the tracks of the first
+# video at $1 and lets the user pick by number or type language codes.
+# On success, fills the global SUB_ARGS with yt-dlp flags and returns 0;
+# on skip, or when the video has no subtitles, returns 1.
+pick_subs() {
+    local rows="" choice tok line kind code langs want_subs want_auto bad
+    local -a toks
+    info "Fetching available subtitles…"
+    if ! rows=$(list_subs "$1" 2>/dev/null); then
+        warn "Couldn't fetch the subtitle list. You can still type language codes."
+        rows=""
+    elif [[ -z "$rows" ]]; then
+        warn "No subtitles available for this video."
+        return 1
+    else
+        (( IS_PLAYLIST )) && info "(Showing tracks of the first video; codes apply to every video.)"
+        echo
+        print_sub_section "Uploaded subtitles"      subs "$rows"
+        print_sub_section "Auto-generated captions" auto "$rows"
+    fi
+
+    while true; do
+        ask "Pick numbers or language codes (e.g. 1,3 or en,de), Enter to skip" "" choice
+        [[ -z "$choice" ]] && return 1
+        langs=""; want_subs=0; want_auto=0; bad=0
+        read -ra toks <<<"${choice//,/ }"
+        for tok in "${toks[@]}"; do
+            if [[ "$tok" =~ ^[0-9]+$ ]]; then
+                line=$(awk -v n="$tok" 'NR==n' <<<"$rows")
+                if [[ -z "$line" ]]; then
+                    warn "Number out of range: $tok"
+                    bad=1
+                    break
+                fi
+                IFS=$'\t' read -r kind code _ <<<"$line"
+                if [[ "$kind" == "subs" ]]; then want_subs=1; else want_auto=1; fi
+            else
+                # Typed code: let yt-dlp match it in either list
+                # (uploaded subtitles win over auto-generated ones).
+                code="$tok"; want_subs=1; want_auto=1
+            fi
+            langs="${langs:+$langs,}$code"
+        done
+        [[ $bad -eq 0 && -n "$langs" ]] && break
+    done
+
+    SUB_ARGS=()
+    (( want_subs )) && SUB_ARGS+=(--write-subs)
+    (( want_auto )) && SUB_ARGS+=(--write-auto-subs)
+    SUB_ARGS+=(--sub-langs "$langs")
+    if confirm "Embed subtitles in the video file? (n = separate .srt files)" "y"; then
+        # yt-dlp keeps the .vtt files when --write-subs is passed explicitly;
+        # no-keep-subs makes it delete them once they are embedded.
+        SUB_ARGS+=(--embed-subs --compat-options no-keep-subs)
+    else
+        SUB_ARGS+=(--convert-subs srt)
+    fi
+    ok "Subtitles: $langs"
 }
 
 # ---------- preflight ----------
@@ -487,6 +577,20 @@ else
     ask "Audio bitrate cap (best, or kbps like 128)"          "best" AUDIO_BITRATE
 fi
 
+# Cookies let YouTube treat us as a signed-in browser, which avoids
+# "Sign in to confirm you're not a bot" on long playlists.
+ask "Cookies: browser name (firefox/chrome/brave/...) or cookies.txt path, Enter for none" "" COOKIES
+COOKIES="${COOKIES/#\~/$HOME}"
+COOKIE_ARGS=()
+if [[ -f "$COOKIES" ]]; then
+    COOKIE_ARGS=(--cookies "$COOKIES")
+elif [[ -n "$COOKIES" ]]; then
+    COOKIE_ARGS=(--cookies-from-browser "$COOKIES")
+fi
+
+# IDs of finished downloads. Re-running a URL skips everything listed here.
+ARCHIVE="${DEST%/}/.ytdlp-archive.txt"
+
 # ---------- per-URL loop ----------
 ITER=0
 while true; do
@@ -502,6 +606,8 @@ while true; do
     ALBUM_ARTIST=""; ARTIST=""; ALBUM=""; GENRE=""; YEAR=""
     ART_URL=""; ART_FILE=""
     FFMPEG_META=()
+    SUB_ARGS=()
+    SLEEP_BETWEEN=0
     CMD=()
     TEMPLATE=""
 
@@ -527,6 +633,9 @@ while true; do
     info "── Playlist vs single track ──"
     if confirm "Is this a playlist/album?" "y"; then
         IS_PLAYLIST=1
+        if confirm "Pause between videos to avoid YouTube's bot check? (adds ~15-30 s each)" "y"; then
+            SLEEP_BETWEEN=1
+        fi
     else
         IS_PLAYLIST=0
     fi
@@ -575,6 +684,12 @@ while true; do
                     fi
                 fi
             fi
+        fi
+    else
+        echo
+        info "── Subtitles ──"
+        if confirm "Download subtitles?" "n"; then
+            pick_subs "$URL" || true
         fi
     fi
 
@@ -660,6 +775,14 @@ while true; do
         # No post-process needed in video mode, but we keep the produced-files
         # list for consistency / future use.
         CMD+=(--print-to-file "after_move:%(filepath)s" "$PRODUCED_LIST")
+        if (( ${#SUB_ARGS[@]} > 0 )); then
+            CMD+=("${SUB_ARGS[@]}")
+        fi
+    fi
+
+    CMD+=(--download-archive "$ARCHIVE" ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"})
+    if (( SLEEP_BETWEEN )); then
+        CMD+=(-t sleep)
     fi
 
     CMD+=("$URL")
@@ -687,7 +810,7 @@ while true; do
     echo
     ok "Downloading to: $DEST"
     echo
-    "${CMD[@]}"
+    "${CMD[@]}" || warn "yt-dlp reported errors (see above). Run the same URL again to retry; finished items are skipped."
 
     # ---------- post-process: embed custom artwork (music mode only) ----------
     if [[ "$MODE" == "music" ]]; then
