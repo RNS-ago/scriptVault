@@ -54,10 +54,13 @@ if [[ -n "$gstatus" ]]; then
     vargit commit -m "Automated snapshot" -m "$gstatus"
 fi
 
-if vargit fetch --quiet; then
-    vargit pull --rebase
-    vargit push
-else
-    echo "No network — skipping remote sync, will retry next run." >&2
-    exit 0
-fi
+for attempt in 1 2 3 4 5; do
+    if vargit fetch --quiet; then
+        vargit pull --rebase
+        vargit push
+        exit 0
+    fi
+    sleep 15
+done
+echo "No network — skipping remote sync, will retry next run." >&2
+exit 0
