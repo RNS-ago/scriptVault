@@ -495,15 +495,175 @@ pick_subs() {
     ok "Subtitles: $langs"
 }
 
+# ---------- installers ----------
+# Make sure $1 is on PATH for the rest of this session. No-op if it already is.
+# When it does add the dir, say so: the change doesn't outlive this run.
+ensure_on_path() {
+    local dir="$1"
+    case ":$PATH:" in
+        *":$dir:"*) return 0 ;;
+    esac
+    export PATH="$dir:$PATH"
+    warn "Added ${dir} to PATH for this session only."
+    warn "To make it permanent, add to your shell config:"
+    warn "    export PATH=\"${dir/#$HOME/\$HOME}:\$PATH\""
+}
+
+# Download the official yt-dlp release (Python zipapp) into ~/.local/bin.
+install_ytdlp() {
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is required to install yt-dlp. Please install curl first."
+        return 1
+    fi
+    # The release file is a Python zipapp: without python3 >= 3.10 it won't run.
+    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+        err "yt-dlp needs python3 3.10 or newer, found: $(python3 -V 2>&1 | head -n1)"
+        err "Install a newer Python (macOS: brew install python), then re-run."
+        return 1
+    fi
+    local bindir="$HOME/.local/bin"
+    mkdir -p "$bindir"
+    info "Downloading yt-dlp to ${bindir}/yt-dlp …"
+    if ! curl -L --fail --progress-bar \
+            https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o "${bindir}/yt-dlp"; then
+        err "Download failed."
+        return 1
+    fi
+    chmod a+rx "${bindir}/yt-dlp"
+    ensure_on_path "$bindir"
+    ok "yt-dlp installed."
+}
+
+# Run the official Deno installer. It writes to ~/.deno/bin and patches the
+# user's shell rc files, but not the running shell — so we manually add the
+# bin dir to PATH for this session afterward.
+install_deno() {
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is required to install Deno. Please install curl first."
+        return 1
+    fi
+    info "Running the Deno installer (curl … | sh) …"
+    if ! curl -fsSL https://deno.land/install.sh | sh; then
+        err "Deno installation failed."
+        return 1
+    fi
+    local deno_bin="$HOME/.deno/bin"
+    if [[ ! -x "$deno_bin/deno" ]]; then
+        err "Deno binary not found at ${deno_bin}/deno after install."
+        return 1
+    fi
+    ensure_on_path "$deno_bin"
+    ok "Deno installed."
+    warn "Note: open a new shell (or source your rc file) to use Deno outside this script."
+}
+
+# Print the package-manager command that installs a package here, or nothing
+# if there's no known package manager (or no way to get root). Used for tools
+# with no single portable build like yt-dlp/Deno (ffmpeg, python3).
+# Args: the package's name on apt, dnf, pacman, brew (they differ).
+pkg_install_cmd() {
+    local apt="$1" dnf="$2" pacman="$3" brew="$4"
+    if command -v brew >/dev/null 2>&1; then
+        echo "brew install ${brew}"   # brew refuses to run under sudo
+        return 0
+    fi
+    local s=""
+    if (( EUID != 0 )); then
+        command -v sudo >/dev/null 2>&1 || return 0
+        s="sudo "
+    fi
+    if   command -v apt-get >/dev/null 2>&1; then echo "${s}apt-get update && ${s}apt-get install -y ${apt}"
+    elif command -v dnf     >/dev/null 2>&1; then echo "${s}dnf install -y ${dnf}"
+    elif command -v pacman  >/dev/null 2>&1; then echo "${s}pacman -S --needed --noconfirm ${pacman}"
+    fi
+}
+
+# Offer to install missing command $1 by running $2 (from pkg_install_cmd).
+# Exits the script if the user refuses or the install doesn't work.
+require_pkg() {
+    local bin="$1" cmd="$2"
+    warn "${bin} is not installed or not on PATH."
+    if [[ -z "$cmd" ]]; then
+        err "${bin} is required. Install it with your package manager, then re-run."
+        exit 1
+    fi
+    if ! confirm "Install ${bin} now? Runs: ${cmd}" "y"; then
+        err "${bin} is required. Install it yourself, then re-run:"
+        echo "    ${cmd}"
+        exit 1
+    fi
+    # Safe to eval: the string comes from pkg_install_cmd, never from input.
+    eval "$cmd" || { err "${bin} installation failed."; exit 1; }
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        err "${bin} still not found after install."
+        exit 1
+    fi
+    ok "${bin} installed."
+}
+
 # ---------- preflight ----------
-if ! command -v yt-dlp >/dev/null 2>&1; then
-    err "yt-dlp is not installed or not on PATH."
-    echo "Install: pipx install yt-dlp   (or)   brew install yt-dlp"
-    exit 1
+# A previous install may have left yt-dlp / Deno in their default dirs without
+# those dirs being on PATH yet. Patch them in so we don't offer to reinstall.
+[[ -x "$HOME/.local/bin/yt-dlp" ]] && ensure_on_path "$HOME/.local/bin"
+[[ -x "$HOME/.deno/bin/deno"   ]] && ensure_on_path "$HOME/.deno/bin"
+
+# python3 runs the yt-dlp release build (install_ytdlp checks for 3.10+) and
+# powers the artwork search and the subtitle picker. Checked first for that.
+if ! command -v python3 >/dev/null 2>&1; then
+    require_pkg python3 "$(pkg_install_cmd python3 python3 python python)"
 fi
 
+if ! command -v yt-dlp >/dev/null 2>&1; then
+    warn "yt-dlp is not installed or not on PATH."
+    if ! confirm "Install yt-dlp now (to ~/.local/bin)?" "y"; then
+        err "yt-dlp is required. Install it yourself, then re-run:"
+        echo "    pipx install yt-dlp   (or)   brew install yt-dlp"
+        exit 1
+    fi
+    install_ytdlp || exit 1
+fi
+
+# Sites change often and old yt-dlp builds break, so offer an update when a
+# newer stable release exists. Offline / timeout: skip the check silently.
+YTDLP_CUR=$(yt-dlp --version 2>/dev/null || true)
+YTDLP_NEW=$(curl -fsLI -o /dev/null -w '%{url_effective}' --max-time 5 \
+    https://github.com/yt-dlp/yt-dlp/releases/latest 2>/dev/null || true)
+YTDLP_NEW="${YTDLP_NEW##*/}"   # .../releases/tag/2026.10.26 -> 2026.10.26
+# sort -VC succeeds when CUR <= NEW, so a newer nightly build isn't "outdated".
+if [[ "$YTDLP_NEW" =~ ^[0-9.]+$ && -n "$YTDLP_CUR" && "$YTDLP_CUR" != "$YTDLP_NEW" ]] \
+    && printf '%s\n' "$YTDLP_CUR" "$YTDLP_NEW" | sort -VC; then
+    warn "yt-dlp ${YTDLP_CUR} is out of date (latest: ${YTDLP_NEW})."
+    if confirm "Update yt-dlp now?" "y"; then
+        yt-dlp -U || true
+        # -U refuses for pip/pipx/apt/brew installs (and prints how to update
+        # instead), so trust the version it reports, not its exit code.
+        if [[ "$(yt-dlp --version 2>/dev/null)" == "$YTDLP_CUR" ]]; then
+            warn "yt-dlp is still ${YTDLP_CUR}. Update it with the tool you installed it with."
+        else
+            ok "yt-dlp updated to $(yt-dlp --version)."
+        fi
+    else
+        warn "Continuing with yt-dlp ${YTDLP_CUR}."
+    fi
+fi
+
+# yt-dlp needs a JS runtime for full YouTube support (since 2025.11.12).
+if ! command -v deno >/dev/null 2>&1; then
+    warn "Deno (JS runtime) is not installed or not on PATH."
+    warn "yt-dlp needs it for full YouTube support."
+    if ! confirm "Install Deno now (to ~/.deno)?" "y"; then
+        err "Deno is required. Install it yourself, then re-run:"
+        echo "    curl -fsSL https://deno.land/install.sh | sh   (or)   brew install deno"
+        exit 1
+    fi
+    install_deno || exit 1
+fi
+
+# ffmpeg does the audio extraction, video merging and tag/artwork embedding.
 if ! command -v ffmpeg >/dev/null 2>&1; then
-    warn "ffmpeg not found — audio extraction and embedding may fail."
+    # Fedora's own repo ships it as ffmpeg-free (the full build is in RPM Fusion).
+    require_pkg ffmpeg "$(pkg_install_cmd ffmpeg ffmpeg-free ffmpeg ffmpeg)"
 fi
 
 if (( BASH_VERSINFO[0] < 4 )); then
@@ -735,12 +895,14 @@ while true; do
         CMD+=(--print-to-file "after_move:%(filepath)s" "$PRODUCED_LIST")
 
         # Always-useful parse-metadata mappings (used when overrides are blank)
+        # Fall back only when the source has no native value (same chains as
+        # fetch_preview), so real artist/album tags from YouTube Music survive.
         if [[ $IS_PLAYLIST -eq 1 ]]; then
             CMD+=(--parse-metadata "playlist_index:%(track_number)s")
-            CMD+=(--parse-metadata "playlist_title:%(album)s")
+            CMD+=(--parse-metadata "%(album,playlist_title)s:%(album)s")
         fi
-        CMD+=(--parse-metadata "uploader:%(artist)s")
-        CMD+=(--parse-metadata "uploader:%(album_artist)s")
+        CMD+=(--parse-metadata "%(artist,uploader)s:%(artist)s")
+        CMD+=(--parse-metadata "%(album_artist,uploader)s:%(album_artist)s")
 
         add_meta_override "album_artist" "$ALBUM_ARTIST" "$PREVIEW_ALBUM_ARTIST"
         add_meta_override "artist"       "$ARTIST"       "$PREVIEW_ARTIST"
