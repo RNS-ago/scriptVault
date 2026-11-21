@@ -77,7 +77,15 @@ fi
 echo "--- sshd effective settings"
 SSHD=$(command -v sshd 2>/dev/null || { [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd; })
 if [ -n "$SSHD" ]; then
-  if ! out=$("$SSHD" -T 2>&1); then
+  out=$("$SSHD" -T 2>&1); rc=$?
+  # socket-activated sshd (systemd holds :22, e.g. Ubuntu 22.10+) has no privsep dir until the
+  # first login, and sshd -T refuses to run without it. Create the empty dir sshd would create itself.
+  dir=$(echo "$out" | sed -n "s/.*Missing privilege separation directory: \([^[:space:]]*\).*/\1/p")
+  if [ "$rc" -ne 0 ] && [ -n "$dir" ] && mkdir -m 0755 "$dir"; then
+    echo "  (created missing $dir so sshd -T can run)"
+    out=$("$SSHD" -T 2>&1); rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
     echo "  !! sshd -T failed, settings NOT checked:"
     echo "$out" | head -3
   else
@@ -142,7 +150,8 @@ for id in "${IDS[@]}"; do
   echo "================ CT $id  ${name:-?} ================"
   # timeout: a hung mount in the CT must not stall the whole audit.
   # cat -v: CT output is untrusted, so show escape sequences instead of sending them to the terminal.
-  timeout 120 pct exec "$id" -- sh -c "$INNER" 2>&1 | cat -v
+  # tr -d: sshd writes its errors with \r\n, which cat -v would show as ^M
+  timeout 120 pct exec "$id" -- sh -c "$INNER" 2>&1 | tr -d '\r' | cat -v
   [ "${PIPESTATUS[0]}" -eq 124 ] && echo "  !! timed out after 120s, output above is incomplete"
 
   if [ "$SCAN" -eq 1 ]; then
