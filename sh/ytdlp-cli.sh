@@ -20,6 +20,7 @@ ok()    { printf "%s%s%s\n" "$GREEN"  "$*" "$RESET"; }
 # If the answer is a quit sentinel, exit cleanly. Called by every input helper
 # below so the user can abort from any prompt without hunting for Ctrl-C.
 # The cleanup trap on EXIT still fires, so the temp dir gets removed.
+# Also called with :q when stdin closes, so piped input can't loop on defaults.
 maybe_quit() {
     case "$1" in
         :q|:Q|:quit|:QUIT|:exit)
@@ -38,7 +39,7 @@ ask() {
     else
         printf "%s%s%s: " "$BOLD" "$prompt" "$RESET"
     fi
-    IFS= read -r answer || true
+    IFS= read -r answer || [[ -n "$answer" ]] || maybe_quit :q
     maybe_quit "$answer"
     [[ -z "$answer" ]] && answer="$default"
     printf -v "$__var" '%s' "$answer"
@@ -56,14 +57,14 @@ ask_prefill() {
         local p
         p=$'\001'"$BOLD"$'\002'"$prompt"$'\001'"$RESET"$'\002'": "
         # shellcheck disable=SC2162
-        IFS= read -r -e -i "$prefill" -p "$p" answer || true
+        IFS= read -r -e -i "$prefill" -p "$p" answer || [[ -n "$answer" ]] || maybe_quit :q
     elif [[ -n "$prefill" ]]; then
         printf "%s%s%s %s[%s]%s: " "$BOLD" "$prompt" "$RESET" "$DIM" "$prefill" "$RESET"
-        IFS= read -r answer || true
+        IFS= read -r answer || [[ -n "$answer" ]] || maybe_quit :q
         [[ -z "$answer" ]] && answer="$prefill"
     else
         printf "%s%s%s: " "$BOLD" "$prompt" "$RESET"
-        IFS= read -r answer || true
+        IFS= read -r answer || [[ -n "$answer" ]] || maybe_quit :q
     fi
     maybe_quit "$answer"
     printf -v "$__var" '%s' "$answer"
@@ -278,6 +279,34 @@ embed_artwork_file() {
     local ext="${audio##*.}"
     local tmp="${audio%.*}.__cover_tmp__.${ext}"
 
+    if [[ "${ext,,}" == opus || "${ext,,}" == ogg ]]; then
+        # ffmpeg can't mux a cover image into Ogg. Write it the way yt-dlp does:
+        # a base64 FLAC picture block in the Vorbis comments, via mutagen.
+        local rc=0
+        python3 - "$audio" "$art" <<'PY' || rc=$?
+import base64, sys
+try:
+    from mutagen import File
+    from mutagen.flac import Picture
+except ImportError:
+    sys.exit(3)
+audio, art = sys.argv[1:]
+pic = Picture()
+pic.type, pic.desc = 3, "Cover (front)"  # 3 = front cover
+pic.data = open(art, "rb").read()
+pic.mime = "image/png" if pic.data[:4] == b"\x89PNG" else "image/jpeg"
+f = File(audio)
+f["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+f.save()
+PY
+        case $rc in
+            0) return 0 ;;
+            3) warn "Can't embed artwork into ${audio##*/}: Ogg/Opus covers need the Python mutagen module (pip install mutagen, or apt install python3-mutagen)" ;;
+            *) warn "Failed to embed artwork into ${audio##*/}" ;;
+        esac
+        return 1
+    fi
+
     case "${ext,,}" in
         mp3)
             ffmpeg -nostdin -loglevel error -y -i "$audio" -i "$art" \
@@ -291,7 +320,7 @@ embed_artwork_file() {
                 -map 0 -map 1 -c copy -disposition:v:0 attached_pic \
                 "$tmp"
             ;;
-        flac|opus|ogg)
+        flac)
             ffmpeg -nostdin -loglevel error -y -i "$audio" -i "$art" \
                 -map 0:a -map 1:v -c copy \
                 -metadata:s:v title="Album cover" \
@@ -314,7 +343,7 @@ confirm() {
     local prompt="$1" default="${2:-y}" answer
     local hint="[Y/n]"; [[ "$default" == "n" ]] && hint="[y/N]"
     printf "%s%s%s %s " "$BOLD" "$prompt" "$RESET" "$hint"
-    IFS= read -r answer || true
+    IFS= read -r answer || [[ -n "$answer" ]] || maybe_quit :q
     maybe_quit "$answer"
     [[ -z "$answer" ]] && answer="$default"
     [[ "$answer" =~ ^[Yy] ]]
@@ -325,16 +354,20 @@ clean_na() { [[ "$1" == "NA" ]] && printf "" || printf "%s" "$1"; }
 
 # Fetch a metadata preview for the URL (first track only).
 # Sets PREVIEW_* globals; on failure, leaves them empty.
+# PREVIEW_PLAYLIST_ID is set only when yt-dlp treats the URL as a playlist.
 PREVIEW_TITLE=""; PREVIEW_UPLOADER=""; PREVIEW_ALBUM=""
 PREVIEW_ARTIST=""; PREVIEW_ALBUM_ARTIST=""
 PREVIEW_GENRE="";  PREVIEW_YEAR=""
+PREVIEW_PLAYLIST_ID=""; PREVIEW_PLAYLIST=""; PREVIEW_COUNT=""
 fetch_preview() {
     local url="$1" raw key value
-    info "Fetching metadata preview from URL…"
 
-    if ! raw=$(yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+    if ! raw=$(yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
         --skip-download --no-warnings --ignore-no-formats-error \
         --playlist-items 1 \
+        --print "PLAYLIST_ID=%(playlist_id)s" \
+        --print "PLAYLIST=%(playlist_title)s" \
+        --print "COUNT=%(playlist_count)s" \
         --print "TITLE=%(title)s" \
         --print "UPLOADER=%(uploader)s" \
         --print "ALBUM=%(album,playlist_title)s" \
@@ -343,13 +376,16 @@ fetch_preview() {
         --print "GENRE=%(genre)s" \
         --print "YEAR=%(release_year,upload_date>%Y)s" \
         "$url" 2>/dev/null); then
-        warn "Couldn't fetch a preview (continuing without one)."
+        warn "Couldn't fetch info for this URL."
         return 1
     fi
 
     while IFS='=' read -r key value; do
         value=$(clean_na "$value")
         case "$key" in
+            PLAYLIST_ID)  PREVIEW_PLAYLIST_ID="$value" ;;
+            PLAYLIST)     PREVIEW_PLAYLIST="$value" ;;
+            COUNT)        PREVIEW_COUNT="$value" ;;
             TITLE)        PREVIEW_TITLE="$value" ;;
             UPLOADER)     PREVIEW_UPLOADER="$value" ;;
             ALBUM)        PREVIEW_ALBUM="$value" ;;
@@ -410,7 +446,7 @@ build_video_format_selector() {
 #   kind <TAB> code <TAB> name     (kind = subs for uploaded, auto for auto-generated)
 # Uploaded rows come first, so row N is the number shown in the picker.
 list_subs() {
-    yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+    yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
         -j --no-warnings --ignore-no-formats-error --playlist-items 1 "$1" \
     | python3 -c '
 import sys, json
@@ -763,6 +799,8 @@ while true; do
     PREVIEW_TITLE=""; PREVIEW_UPLOADER=""; PREVIEW_ALBUM=""
     PREVIEW_ARTIST=""; PREVIEW_ALBUM_ARTIST=""
     PREVIEW_GENRE="";  PREVIEW_YEAR=""
+    PREVIEW_PLAYLIST_ID=""; PREVIEW_PLAYLIST=""; PREVIEW_COUNT=""
+    EXTRA_ARGS=()
     ALBUM_ARTIST=""; ARTIST=""; ALBUM=""; GENRE=""; YEAR=""
     ART_URL=""; ART_FILE=""
     FFMPEG_META=()
@@ -789,22 +827,33 @@ while true; do
         if confirm "Try again?" "y"; then continue; else break; fi
     fi
 
+    # Music links are usually albums; video links usually mean the one video.
+    playlist_default="n"; [[ "$MODE" == "music" ]] && playlist_default="y"
+
+    # A YouTube link to one video that also names a playlist (watch?v=X&list=Y,
+    # youtu.be/X?list=Y): yt-dlp downloads the whole playlist unless told not to.
+    if [[ "$URL" == *[?\&]list=* && ( "$URL" == *[?\&]v=* || "$URL" == *youtu.be/* ) ]] \
+        && ! confirm "This link is a video inside a playlist. Download the whole playlist?" "$playlist_default"; then
+        EXTRA_ARGS=(--no-playlist)
+    fi
+
     echo
-    info "── Playlist vs single track ──"
-    if confirm "Is this a playlist/album?" "y"; then
-        IS_PLAYLIST=1
-        if confirm "Pause between videos to avoid YouTube's bot check? (adds ~15-30 s each)" "y"; then
-            SLEEP_BETWEEN=1
+    info "Fetching info…"
+    if fetch_preview "$URL"; then
+        if [[ -n "$PREVIEW_PLAYLIST_ID" ]]; then
+            IS_PLAYLIST=1
+            info "Playlist: ${PREVIEW_PLAYLIST:-?}${PREVIEW_COUNT:+ (${PREVIEW_COUNT} items)}"
+        else
+            info "Single video: ${PREVIEW_TITLE:-?}"
         fi
-    else
-        IS_PLAYLIST=0
+    elif confirm "Is this a playlist/album?" "$playlist_default"; then
+        IS_PLAYLIST=1
+    fi
+    if (( IS_PLAYLIST )) && confirm "Pause between videos to avoid YouTube's bot check? (adds ~10-20 s each)" "y"; then
+        SLEEP_BETWEEN=1
     fi
 
     if [[ "$MODE" == "music" ]]; then
-        echo
-        info "── Fetching metadata ──"
-        fetch_preview "$URL" || true
-
         echo
         info "── Detected metadata ──"
         [[ -n "$PREVIEW_TITLE" ]] && preview_row "First track:" "$PREVIEW_TITLE"
@@ -942,7 +991,10 @@ while true; do
         fi
     fi
 
-    CMD+=(--download-archive "$ARCHIVE" ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"})
+    CMD+=(--download-archive "$ARCHIVE" ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
+    # The run is piped through tee (to count archive skips), which turns off
+    # yt-dlp's colours; force them back when we're on a terminal.
+    [[ -t 1 ]] && CMD+=(--color always)
     if (( SLEEP_BETWEEN )); then
         CMD+=(-t sleep)
     fi
@@ -972,7 +1024,22 @@ while true; do
     echo
     ok "Downloading to: $DEST"
     echo
-    "${CMD[@]}" || warn "yt-dlp reported errors (see above). Run the same URL again to retry; finished items are skipped."
+    RUN_LOG="${TMPDIR_RUN}/run.log"
+    "${CMD[@]}" 2>&1 | tee "$RUN_LOG" || warn "yt-dlp reported errors (see above). Run the same URL again to retry; finished items are skipped."
+
+    # The archive lists IDs, not files: a deleted file stays "downloaded".
+    SKIPPED=$(grep -c "has already been recorded in the archive" "$RUN_LOG" || true)
+    if (( SKIPPED > 0 )) && confirm "${SKIPPED} item(s) skipped because the download archive lists them. Download again? (files still on disk aren't re-downloaded)" "n"; then
+        # Check against an empty archive (yt-dlp still skips files that are on
+        # disk), then add only the IDs the real archive lacks, so no duplicates.
+        RETRY_ARCHIVE="${TMPDIR_RUN}/retry-archive.txt"
+        : > "$RETRY_ARCHIVE"
+        echo
+        "${CMD[@]:0:${#CMD[@]}-1}" --download-archive "$RETRY_ARCHIVE" "$URL" \
+            || warn "yt-dlp reported errors (see above)."
+        NEW_IDS=$(grep -vxFf "$ARCHIVE" "$RETRY_ARCHIVE" || true)
+        [[ -n "$NEW_IDS" ]] && printf '%s\n' "$NEW_IDS" >> "$ARCHIVE"
+    fi
 
     # ---------- post-process: embed custom artwork (music mode only) ----------
     if [[ "$MODE" == "music" ]]; then
