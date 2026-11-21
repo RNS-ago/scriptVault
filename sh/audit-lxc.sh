@@ -9,14 +9,17 @@
 #   ./audit-lxc.sh               all running containers
 #   ./audit-lxc.sh 101 105       only these container IDs
 #   ./audit-lxc.sh --scan        also nmap each container from the host (needs: apt install nmap)
+#   ./audit-lxc.sh --udp         --scan plus the top 100 UDP ports (slow: ~2 min per IP, Linux rate-limits ICMP)
 
 set -u
 
 SCAN=0
+UDP=0
 IDS=()
 for a in "$@"; do
   case "$a" in
     --scan) SCAN=1 ;;
+    --udp) SCAN=1; UDP=1 ;;
     *) IDS+=("$a") ;;
   esac
 done
@@ -24,6 +27,16 @@ done
 if [ ${#IDS[@]} -eq 0 ]; then
   mapfile -t IDS < <(pct list | awk 'NR>1 && $2=="running" {print $1}')
 fi
+
+# pct only sees this node; name CTs on other cluster nodes so they are not silently skipped
+me=$(uname -n); me=${me%%.*}
+others=()
+for c in /etc/pve/nodes/*/lxc/*.conf; do
+  [ -e "$c" ] || continue
+  node=${c#/etc/pve/nodes/}; node=${node%%/*}
+  [ "$node" = "$me" ] || others+=("$(basename "$c" .conf)@$node")
+done
+[ ${#others[@]} -gt 0 ] && echo "!! NOT audited, CTs on other cluster nodes (run this script there too): ${others[*]}"
 
 if [ ${#IDS[@]} -eq 0 ]; then
   echo "No running containers found."
@@ -62,6 +75,16 @@ else
   echo "(sshd not installed)"
 fi
 
+# dropbear (common on Alpine) has no config dump; its running command line holds the settings
+db=$(for p in /proc/[0-9]*/cmdline; do tr "\000" " " < "$p" 2>/dev/null; echo; done | grep -E "^([^ ]*/)?dropbear( |$)" | sort -u)
+if [ -n "$db" ]; then
+  echo "--- dropbear running"
+  echo "$db"
+  echo "$db" | grep -qvE " -[A-Za-z]*s" && echo "  !! password login is enabled (no -s)"
+  echo "$db" | grep -qvE " -[A-Za-z]*[gsw]" && echo "  !! root can log in with a password (no -g, -s or -w)"
+  echo "$db" | grep -qE " -[A-Za-z]*B" && echo "  !! empty passwords are allowed (-B)"
+fi
+
 echo "--- authorized_keys"
 found=0
 # every home in /etc/passwd (service accounts too), and authorized_keys2 (in OpenSSH default AuthorizedKeysFile)
@@ -82,11 +105,26 @@ done
 [ "$found" -eq 0 ] && echo "(no authorized_keys files)"
 '
 
+# nmap_scan <nmap args...>: print open ports, or say why there are none.
+# -Pn: CT is known to be running, so a dropped ping must not skip the scan.
+nmap_scan() {
+  local out
+  if ! out=$(nmap -Pn --open -T4 "$@" 2>&1); then
+    echo "  !! nmap failed: $(printf '%s\n' "$out" | tail -1)"
+    return
+  fi
+  printf '%s\n' "$out" | awk '/^[0-9]+\/(tcp|udp)/ { if ($2 == "open") { print; o++ } else nf++ }
+    END { if (nf) print "  (" nf " port(s) open|filtered: no reply, either open or firewalled)"; else if (!o) print "(no open ports)" }'
+}
+
 for id in "${IDS[@]}"; do
   name=$(pct config "$id" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}')
   echo
   echo "================ CT $id  ${name:-?} ================"
-  pct exec "$id" -- sh -c "$INNER" 2>&1
+  # timeout: a hung mount in the CT must not stall the whole audit.
+  # cat -v: CT output is untrusted, so show escape sequences instead of sending them to the terminal.
+  timeout 120 pct exec "$id" -- sh -c "$INNER" 2>&1 | cat -v
+  [ "${PIPESTATUS[0]}" -eq 124 ] && echo "  !! timed out after 120s, output above is incomplete"
 
   if [ "$SCAN" -eq 1 ]; then
     if ! command -v nmap >/dev/null 2>&1; then
@@ -95,13 +133,11 @@ for id in "${IDS[@]}"; do
       ips=$(lxc-info -n "$id" -iH 2>/dev/null | grep -v ':')
       [ -n "$ips" ] || echo "--- nmap from host: (no IPv4 found)"
       for ip in $ips; do
-        echo "--- nmap from host ($ip, TCP only)"
-        # -Pn: CT is known to be running, so a dropped ping must not skip the scan
-        if scan=$(nmap -Pn -sT -p- --open -T4 "$ip" 2>&1); then
-          res=$(printf '%s\n' "$scan" | awk '/^[0-9]+\/tcp/')
-          echo "${res:-(no open TCP ports)}"
-        else
-          echo "  !! nmap failed: $(printf '%s\n' "$scan" | tail -1)"
+        echo "--- nmap TCP from host ($ip)"
+        nmap_scan -sT -p- "$ip"
+        if [ "$UDP" -eq 1 ]; then
+          echo "--- nmap UDP top 100 from host ($ip)"
+          nmap_scan -sU --top-ports 100 "$ip"
         fi
       done
     fi
