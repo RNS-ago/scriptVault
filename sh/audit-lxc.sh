@@ -28,6 +28,25 @@ if [ ${#IDS[@]} -eq 0 ]; then
   mapfile -t IDS < <(pct list | awk 'NR>1 && $2=="running" {print $1}')
 fi
 
+# Colour output on a terminal only (plain when piped or NO_COLOR is set).
+# Runs after cat -v, so containers still cannot inject their own escape codes.
+paint() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    local e=$'\033' r=$'\033[0m'
+    # each rule is anchored at ^, so a line coloured by an earlier rule is skipped by later ones
+    sed -E \
+      -e "s/^=+ CT .*/${e}[1;36m&$r/" \
+      -e "s/^--- .*/${e}[1m&$r/" \
+      -e "s/^ *!!.*/${e}[1;31m&$r/" \
+      -e "s/^(tcp|udp)[0-9]* .*(127\.[0-9]|\[::1\]|::1:).*/${e}[90m&$r/" \
+      -e "s/^(tcp|udp)[0-9]* .*/${e}[33m&$r/" \
+      -e "s/^[0-9]+\/(tcp|udp) .*/${e}[1;33m&$r/" \
+      -e "s/^\/.*: [0-9]+ key\(s\)$/${e}[35m&$r/"
+  else
+    cat
+  fi
+}
+
 # pct only sees this node; name CTs on other cluster nodes so they are not silently skipped
 me=$(uname -n); me=${me%%.*}
 others=()
@@ -36,7 +55,7 @@ for c in /etc/pve/nodes/*/lxc/*.conf; do
   node=${c#/etc/pve/nodes/}; node=${node%%/*}
   [ "$node" = "$me" ] || others+=("$(basename "$c" .conf)@$node")
 done
-[ ${#others[@]} -gt 0 ] && echo "!! NOT audited, CTs on other cluster nodes (run this script there too): ${others[*]}"
+[ ${#others[@]} -gt 0 ] && echo "!! NOT audited, CTs on other cluster nodes (run this script there too): ${others[*]}" | paint
 
 if [ ${#IDS[@]} -eq 0 ]; then
   echo "No running containers found."
@@ -142,4 +161,4 @@ for id in "${IDS[@]}"; do
       done
     fi
   fi
-done
+done | paint
